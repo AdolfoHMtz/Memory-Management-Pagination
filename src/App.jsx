@@ -1,681 +1,527 @@
-import React, {  useReducer, useState, useEffect, createContext, useContext } from "react";
-import { Dialog, DialogTitle, DialogContent, DialogActions, Button, TextField, MenuItem, Select, FormControl, InputLabel, Snackbar, Alert, Switch, FormControlLabel, Box, Typography, Divider, Tooltip, IconButton, Chip } from "@mui/material";
-import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
-import CompressIcon from "@mui/icons-material/Compress";
-import RestartAltIcon from "@mui/icons-material/RestartAlt";
+// =============================
+// App.jsx (UN SOLO ARCHIVO) – MVP Paginación: Ejercicio 1 (depurado + fix TSX)
+// Parámetros fijos del ejercicio: MP=700KB, página=100KB.
+// Secuencia compacta (5 pasos):
+//  1) T1(225) llega y se traduce (DV=125)
+//  2) T2(100) llega y se traduce (DV=55)
+//  3) Sale T1
+//  4) T3(500) llega y se traduce (DV=425)
+//  5) T4(50)  llega y se traduce (DV=25)
+// Artefactos mostrados: (1) Secundario (tabla del trabajo activo), (2) Memoria principal,
+// (3) TMP del trabajo activo, (4) Tabla global de marcos,
+// (5) Cálculo DV→DF paso a paso, (6) Línea roja Secundario↔Principal,
+// (7) Ficha del trabajo actual con selector DV.
+// Cambios: corrige SyntaxError por paréntesis extra en ternario del inciso (7),
+// define statPill y agrega smoke tests adicionales.
+// =============================
 
-const PaletaColores = [
-  "#0ea5e9", "#22c55e", "#eab308", "#f97316", "#ec4899",
-  "#8b5cf6", "#14b8a6", "#f43f5e", "#84cc16", "#06b6d4",
-];
-const idAleatorio = () => Math.random().toString(36).slice(2, 9);
-const limitar = (min, v, max) => Math.max(min, Math.min(v, max));
-const colorDe = (texto) => { const h = Array.from(texto).reduce((a,c)=>a + c.charCodeAt(0), 0); return PaletaColores[h % PaletaColores.length]; };
+import React, { useMemo, useState, useRef, useLayoutEffect } from "react";
 
-const EstadoContexto = createContext(null);
-export const usarEstado = () => useContext(EstadoContexto);
+// ------------------- Constantes del ejercicio -------------------
+const TAM_MEMORIA_KB = 700; // 7 marcos
+const TAM_PAGINA_KB  = 100; // 100KB
+const NUM_MARCOS     = TAM_MEMORIA_KB / TAM_PAGINA_KB; // 7
 
-const Acciones = {
-  INICIALIZAR_DINAMICAS: "INICIALIZAR_DINAMICAS",
-  ENTRAR_FIJAS: "ENTRAR_FIJAS",
-  CONFIGURAR_FIJAS_MANUAL: "CONFIGURAR_FIJAS_MANUAL",
+// ------------------- Utilidades de paginación -------------------
+function partirEnPaginas(tamanoKB){
+  const numPag = Math.ceil(tamanoKB / TAM_PAGINA_KB);
+  const paginas = [];
+  for(let i=0;i<numPag;i++){
+    const inicio = i * TAM_PAGINA_KB;
+    const fin    = Math.min((i+1)*TAM_PAGINA_KB - 1, tamanoKB - 1);
+    paginas.push({ indice:i, inicio, fin });
+  }
+  const fragInterna = numPag * TAM_PAGINA_KB - tamanoKB;
+  return { paginas, fragInterna };
+}
 
-  CAMBIAR_ALGORITMO: "CAMBIAR_ALGORITMO",
-  TOGGLE_FIFO_FLEX: "TOGGLE_FIFO_FLEX",
-
-  AGREGAR_PROCESO: "AGREGAR_PROCESO",
-  TERMINAR: "TERMINAR",
-  COMPACTAR: "COMPACTAR",
-  ELIMINAR_ESPERA: "ELIMINAR_ESPERA",
-
-  AGREGAR_PROCESO_FIJAS: "AGREGAR_PROCESO_FIJAS",
-  TERMINAR_FIJAS: "TERMINAR_FIJAS",
-
-  REINICIAR: "REINICIAR",
-  INTENTAR_DESDE_ESPERA: "INTENTAR_DESDE_ESPERA",
-};
-
-const uiInicial = { modo: "menu", algoritmo: "firstFit", fifoFlexible: false };
-const estadoInicial = {
-  ui: uiInicial,
-  totalUsuario: 0, 
-  so: 0,          
-
-  // Dinámicas
-  segmentos: [], 
-  ejecutandoIds: [],
-  esperando: [],
-
-  // Fijas
-  fijas: { particiones: [] }, // {id, índice, tamaño, usadoPor?}
-
-  // Métricas
-  estadisticas: { usada: 0, libre: 0, fragExterna: 0, fragInterna: 0, desperdicioVacias: 0, desperdicio: 0 },
-  capturas: [],
-  _snack: null,
-};
-
-function hacerCaptura(estado, etiqueta){
-  const copia = {
-    ui: estado.ui,
-    totalUsuario: estado.totalUsuario,
-    so: estado.so,
-    segmentos: estado.segmentos.map(s=>({...s})),
-    ejecutandoIds: [...estado.ejecutandoIds],
-    esperando: estado.esperando.map(p=>({...p})),
-    fijas: { particiones: estado.fijas.particiones.map(p=>({...p})) },
-    estadisticas: { ...estado.estadisticas },
-    etiqueta,
-    ts: Date.now(),
+function crearEstadoInicial(){
+  return {
+    marcos: Array.from({length: NUM_MARCOS}, (_,i)=>({ marco:i, trabajo:null, pagina:null })),
+    tablaMapas: {},          // { T1: {0:marco,...} }
+    tablaMarcos: Array.from({length: NUM_MARCOS}, (_,i)=>({ marco:i, estado:'Libre', contiene:null })),
+    secundario: {},          // { T1: [P0..Pn] }
+    metaTrabajos: {},        // { T1: { tamKB, numPag, fragInterna } }
+    historial: [],           // snaps por paso (5 pasos totales)
+    marcadores: {},          // índices de pasos clave
   };
-  return copia;
 }
 
-function conSnack(estado, mensaje, severidad='success'){
-  return { ...estado, _snack: { mensaje, severidad, ts: Date.now() } };
-}
-
-function recalc(estado, etiqueta){
-  const e = calcularEstadisticas(estado);
-  const snap = hacerCaptura({ ...estado, estadisticas: e }, etiqueta);
-  return conSnack({ ...estado, estadisticas: e, capturas: [...estado.capturas, snap] }, etiqueta);
-}
-
-function reductor(estado, accion){
-  switch(accion.tipo){
-
-    case Acciones.INICIALIZAR_DINAMICAS: {
-      const { totalUsuario } = accion.datos; if (!Number.isFinite(totalUsuario) || totalUsuario<=0) return conSnack(estado, 'Ingresa memoria válida', 'error');
-      const so = Math.floor(totalUsuario * 0.10);
-      const segs = [ { id:"__so__", tipo:"os", tamaño: so, color: "#374151", nombre:"SO" } ];
-      if (totalUsuario > 0) segs.push({ id: idAleatorio(), tipo:"hueco", tamaño: totalUsuario });
-      const siguiente = { ...estadoInicial, ui: { ...estado.ui, modo: 'dinamicas' }, totalUsuario, so, segmentos: segs };
-      return recalc(siguiente, `Inicializado Dinámicas (${totalUsuario}KB + SO ${so}KB)`);
-    }
-    case Acciones.ENTRAR_FIJAS: {
-      const { totalUsuario } = accion.datos; if (!Number.isFinite(totalUsuario) || totalUsuario<=0) return conSnack(estado, 'Ingresa memoria válida', 'error');
-      const so = Math.floor(totalUsuario * 0.10);
-      return recalc({ ...estadoInicial, ui: { ...estado.ui, modo: 'fijas' }, totalUsuario, so }, `Inicializado Fijas (${totalUsuario}KB + SO ${so}KB)`);
-    }
-    case Acciones.CONFIGURAR_FIJAS_MANUAL: {
-      const { tamaños } = accion.datos;
-      const suma = tamaños.reduce((a,b)=>a+b,0);
-      if (suma !== estado.totalUsuario) return conSnack(estado, `Restan ${estado.totalUsuario - suma} KB por ajustar`, 'error');
-      const particiones = tamaños.map((t, i)=>({ id: idAleatorio(), índice: i+1, tamaño: t, usadoPor: null }));
-      const sig = { ...estado, fijas: { particiones } };
-      return recalc(sig, `Particiones configuradas (${tamaños.length})`);
-    }
-
-    // ================ Configuración común =================
-    case Acciones.CAMBIAR_ALGORITMO: return { ...estado, ui: { ...estado.ui, algoritmo: accion.datos } };
-    case Acciones.TOGGLE_FIFO_FLEX: return { ...estado, ui: { ...estado.ui, fifoFlexible: !!accion.datos } };
-
-    // ================= Dinámicas =================
-    case Acciones.AGREGAR_PROCESO: {
-      const { nombre, tamaño } = accion.datos;
-      if (!nombre?.trim() || !Number.isFinite(tamaño) || tamaño<=0) return conSnack(estado, 'Completa nombre y tamaño', 'error');
-      if (estado.esperando.some(p=>p.nombre===nombre) || estado.segmentos.some(s=>s.tipo==='proceso' && s.nombre===nombre)){
-        return conSnack(estado, `Nombre duplicado: ${nombre}`, 'error');
-      }
-      const proceso = { id: idAleatorio(), nombre: nombre.trim(), tamaño: Math.floor(tamaño), color: colorDe(nombre) };
-      const { asignado, nuevos } = asignarDinamicas(estado.segmentos, proceso, estado.ui.algoritmo);
-      if (asignado){
-        const est2 = { ...estado, segmentos: nuevos, ejecutandoIds: [...estado.ejecutandoIds, proceso.id] };
-        return intentarDesdeEspera(recalc(est2, `Asignado ${proceso.nombre} (${proceso.tamaño}KB)`));
-      }
-      const est3 = { ...estado, esperando: [...estado.esperando, proceso] };
-      return recalc(est3, `En espera ${proceso.nombre} (${proceso.tamaño}KB)`);
-    }
-    case Acciones.TERMINAR: {
-      const { idProceso } = accion.datos;
-      const idx = estado.segmentos.findIndex(s=>s.tipo==='proceso' && s.id===idProceso);
-      if (idx===-1) return estado;
-      const segs = estado.segmentos.map(s=>({...s}));
-      const p = segs[idx];
-      segs[idx] = { id: idAleatorio(), tipo:'hueco', tamaño: p.tamaño };
-      const siguiente = { ...estado, segmentos: segs, ejecutandoIds: estado.ejecutandoIds.filter(i=>i!==idProceso) };
-      return intentarDesdeEspera(recalc(siguiente, `Terminado ${p.nombre}`));
-    }
-    case Acciones.COMPACTAR: {
-      const siguiente = { ...estado, segmentos: compactar(estado.segmentos) };
-      return intentarDesdeEspera(recalc(siguiente, 'Compactación'));
-    }
-    case Acciones.ELIMINAR_ESPERA: {
-      const { idProceso } = accion.datos;
-      return recalc({ ...estado, esperando: estado.esperando.filter(p=>p.id!==idProceso) }, 'Eliminado de espera');
-    }
-
-    // ================= Fijas =================
-    case Acciones.AGREGAR_PROCESO_FIJAS: {
-      const { nombre, tamaño } = accion.datos;
-      if (!nombre?.trim() || !Number.isFinite(tamaño) || tamaño<=0) return conSnack(estado, 'Completa nombre y tamaño', 'error');
-      if (!estado.fijas.particiones.length) return conSnack(estado, 'Configura particiones primero', 'warning');
-      if (estado.fijas.particiones.some(p=>p.usadoPor?.nombre===nombre) || estado.esperando.some(p=>p.nombre===nombre)) return conSnack(estado, `Nombre duplicado: ${nombre}`, 'error');
-      const proceso = { id: idAleatorio(), nombre: nombre.trim(), tamaño: Math.floor(tamaño), color: colorDe(nombre) };
-      const cand = estado.fijas.particiones.map(p=>({ ...p, libre: !p.usadoPor && p.tamaño>=proceso.tamaño, desperd: p.tamaño - proceso.tamaño })).filter(p=>p.libre);
-      let elegida = null; if (estado.ui.algoritmo==='firstFit') elegida = cand[0]||null; else elegida = cand.sort((a,b)=>a.desperd-b.desperd)[0]||null;
-      if (!elegida){
-        const est2 = { ...estado, esperando: [...estado.esperando, proceso] };
-        return recalc(est2, `En espera ${proceso.nombre} (${proceso.tamaño}KB)`);
-      }
-      const fijas = { particiones: estado.fijas.particiones.map(p=> p.id===elegida.id? { ...p, usadoPor: proceso } : p ) };
-      const est3 = { ...estado, fijas, ejecutandoIds: [...estado.ejecutandoIds, proceso.id] };
-      return recalc(est3, `Asignado ${proceso.nombre} a P${elegida.índice}`);
-    }
-    case Acciones.TERMINAR_FIJAS: {
-      const { idProceso } = accion.datos;
-      const fijas = { particiones: estado.fijas.particiones.map(p=> p.usadoPor?.id===idProceso? { ...p, usadoPor: null } : p ) };
-      const est2 = { ...estado, fijas, ejecutandoIds: estado.ejecutandoIds.filter(i=>i!==idProceso) };
-      return intentarDesdeEsperaFijas(recalc(est2, 'Terminado (fijas)'));
-    }
-
-    // ================= Misc =================
-    case Acciones.REINICIAR: return { ...estadoInicial, ui: { ...estado.ui, modo: 'menu' } };
-    case Acciones.INTENTAR_DESDE_ESPERA: return intentarDesdeEspera(estado);
-
-    default: return estado;
-  }
-}
-
-// ============================ Utilidades Dinámicas ===========================
-const listarHuecos = (segs) => segs.map((s,i)=>({...s, i})).filter(s=>s.tipo==='hueco');
-function asignarDinamicas(segmentos, proceso, algoritmo){
-  const huecos = listarHuecos(segmentos);
-  let elegido = null;
-  if (algoritmo==='bestFit') elegido = huecos.filter(h=>h.tamaño>=proceso.tamaño).sort((a,b)=>a.tamaño-b.tamaño)[0]||null;
-  else elegido = huecos.find(h=>h.tamaño>=proceso.tamaño)||null;
-  if (!elegido) return { asignado:false, nuevos: segmentos };
-  const segs = segmentos.map(s=>({...s}));
-  const h = segs[elegido.i];
-  segs.splice(elegido.i, 1,
-    { id: proceso.id, tipo:'proceso', tamaño: proceso.tamaño, nombre: proceso.nombre, color: proceso.color },
-    ...(h.tamaño-proceso.tamaño>0? [{ id: idAleatorio(), tipo:'hueco', tamaño: h.tamaño - proceso.tamaño }] : [])
-  );
-  return { asignado:true, nuevos: segs };
-}
-function compactar(segmentos){
-  const esSO = segmentos[0]?.tipo==='os'? segmentos[0]: null;
-  const resto = esSO? segmentos.slice(1): segmentos;
-  const procesos = resto.filter(s=>s.tipo==='proceso');
-  const totalResto = resto.reduce((a,s)=>a+s.tamaño,0);
-  const usada = procesos.reduce((a,s)=>a+s.tamaño,0);
-  const hueco = totalResto - usada;
-  const nuevoResto = [ ...procesos.map(p=>({...p})), ...(hueco>0?[{ id: idAleatorio(), tipo:'hueco', tamaño: hueco }]:[]) ];
-  return esSO? [esSO, ...nuevoResto] : nuevoResto;
-}
-function intentarDesdeEspera(estado){
-  if (!estado.esperando.length) return estado;
-  let segs = estado.segmentos.map(s=>({...s}));
-  let esperando = [...estado.esperando];
-  let ejecutando = [...estado.ejecutandoIds];
-  const flex = !!estado.ui.fifoFlexible; // flexible: probar con todos
-  const alg = estado.ui.algoritmo;
-
-  if (!flex){
-
-    const p = esperando[0];
-    const res = asignarDinamicas(segs, p, alg);
-    if (res.asignado){ segs = res.nuevos; ejecutando.push(p.id); esperando.shift(); }
-    return recalc({ ...estado, segmentos: segs, esperando, ejecutando }, 'Intento (FIFO estricto)');
-  }
-  // FLEXIBLE: intenta con todos los que quepan
-  for (let i=0;i<esperando.length;i++){
-    const p = esperando[i];
-    const res = asignarDinamicas(segs, p, alg);
-    if (res.asignado){ segs = res.nuevos; ejecutando.push(p.id); esperando.splice(i,1); i--; }
-  }
-  return recalc({ ...estado, segmentos: segs, esperando, ejecutando }, 'Intento (FIFO flexible)');
-}
-
-// =========================== Utilidades Fijas ===============================
-function intentarDesdeEsperaFijas(estado){
-  if (!estado.esperando.length || !estado.fijas.particiones.length) return estado;
-  let esperando = [...estado.esperando];
-  let f = { particiones: estado.fijas.particiones.map(p=>({...p})) };
-  let ejecutando = [...estado.ejecutandoIds];
-  const flex = !!estado.ui.fifoFlexible;
-  const alg = estado.ui.algoritmo;
-  const intenta = (proc)=>{
-    const cand = f.particiones.map(p=>({ ...p, libre: !p.usadoPor && p.tamaño>=proc.tamaño, desperd: p.tamaño-proc.tamaño })).filter(p=>p.libre);
-    let e = null; if (alg==='firstFit') e = cand[0]||null; else e = cand.sort((a,b)=>a.desperd-b.desperd)[0]||null;
-    if (!e) return false; f.particiones = f.particiones.map(p=> p.id===e.id? { ...p, usadoPor: proc } : p ); ejecutando.push(proc.id); return true;
+function clonarEstado(e){
+  return {
+    marcos: e.marcos.map(x=>({...x})),
+    tablaMapas: Object.fromEntries(Object.entries(e.tablaMapas).map(([k,v])=>[k,{...v}])) ,
+    tablaMarcos: e.tablaMarcos.map(x=>({...x})),
+    secundario: Object.fromEntries(Object.entries(e.secundario).map(([k,arr])=>[k,arr.map(y=>({...y}))])) ,
+    metaTrabajos: Object.fromEntries(Object.entries(e.metaTrabajos).map(([k,v])=>[k,{...v}])),
+    historial: [...e.historial],
+    marcadores: {...e.marcadores},
   };
-  if (!flex){
-    const p = esperando[0]; if (intenta(p)) esperando.shift();
-  } else {
-    for (let i=0;i<esperando.length;i++){ if (intenta(esperando[i])){ esperando.splice(i,1); i--; } }
-  }
-  return recalc({ ...estado, fijas: f, esperando, ejecutando }, flex? 'Intento (flexible fijas)' : 'Intento (estricto fijas)');
 }
 
-// =============================== Métricas ==================================
-function calcularEstadisticas(estado){
-  if (estado.ui.modo==='fijas' && estado.fijas.particiones.length){
-    const usada = estado.fijas.particiones.reduce((a,p)=>a + (p.usadoPor? p.usadoPor.tamaño:0),0);
-    const totalParts = estado.fijas.particiones.reduce((a,p)=>a+p.tamaño,0);
-    const libreInterno = estado.fijas.particiones.reduce((a,p)=> p.usadoPor? a + (p.tamaño - p.usadoPor.tamaño) : a, 0);
-    const vacias = estado.fijas.particiones.filter(p=>!p.usadoPor).reduce((a,p)=>a+p.tamaño,0);
-    const libre = libreInterno + vacias;
-    const interna = libreInterno;
-    const desperdicioVacias = vacias;
-    const desperdicio = interna + desperdicioVacias;
-    return { usada, libre, fragExterna: 0, fragInterna: interna, desperdicioVacias, desperdicio };
-  }
-  // Dinámicas (SO no cuenta):
-  const usada = estado.segmentos.filter(s=>s.tipo==='proceso').reduce((a,s)=>a+s.tamaño,0);
-  const huecos = estado.segmentos.filter(s=>s.tipo==='hueco');
-  const libre = huecos.reduce((a,s)=>a+s.tamaño,0);
-  const menorEnEspera = estado.esperando.length? Math.min(...estado.esperando.map(p=>p.tamaño)) : 0;
-  const maxHueco = huecos.length? Math.max(...huecos.map(h=>h.tamaño)) : 0;
-  let externa = 0;
-  if (menorEnEspera>0 && libre >= menorEnEspera && maxHueco < menorEnEspera){
-    externa = libre; // contamos toda la libre como desperdiciada por fragmentación
-  }
-  return { usada, libre, fragExterna: externa, fragInterna: 0, desperdicioVacias: 0, desperdicio: externa };
+function fotografiar(e, etiqueta, ligadura=null){
+  const copia = clonarEstado(e); copia.etiqueta = etiqueta; copia.ligadura = ligadura; e.historial.push(copia);
 }
 
-// =============================== App / UI ==================================
-export default function App(){
-  const [estado, despachar] = useReducer(reductor, estadoInicial);
-  const [snack, setSnack] = useState(null);
-  useEffect(()=>{ if (estado._snack) setSnack(estado._snack); }, [estado._snack]);
+function marcoLibre(e){ return e.marcos.findIndex(m=>m.trabajo===null); }
 
-  useEffect(()=>{
-    if (estado.ui.modo !== 'dinamicas') return;
-    if (!estado.esperando.length) return;
-    const huecos = estado.segmentos.filter(s=>s.tipo==='hueco');
-    if (!huecos.length) return;
-    const maxHueco = Math.max(...huecos.map(h=>h.tamaño));
-    const primero = estado.esperando[0];
-    if (!estado.ui.fifoFlexible){
-      // Estricto: solo intenta el primero y nunca procesa los siguientes
-      if (primero && maxHueco >= primero.tamaño) {
-        despachar({ tipo: Acciones.INTENTAR_DESDE_ESPERA });
-      }
-      // Si el primero no cabe, no hace nada (no revisa los demás)
-    } else {
-      // Flexible: si existe alguno que quepa, intentar
-      const cabeAlguno = estado.esperando.some(p=> maxHueco >= p.tamaño);
-      if (cabeAlguno) despachar({ tipo: Acciones.INTENTAR_DESDE_ESPERA });
-    }
-  }, [estado.segmentos, estado.esperando.length, estado.ui.fifoFlexible, estado.ui.modo]);
-
-  // Si cambia algoritmo o FIFO y hay en espera, reintenta respetando el modo FIFO
-  useEffect(()=>{
-    if (estado.ui.modo !== 'dinamicas' || !estado.esperando.length) return;
-    const huecos = estado.segmentos.filter(s=>s.tipo==='hueco');
-    if (!huecos.length) return;
-    const maxHueco = Math.max(...huecos.map(h=>h.tamaño));
-    const primero = estado.esperando[0];
-    if (!estado.ui.fifoFlexible){
-      // Estricto: solo intenta el primero
-      if (primero && maxHueco >= primero.tamaño) {
-        despachar({ tipo: Acciones.INTENTAR_DESDE_ESPERA });
-      }
-    } else {
-      // Flexible: si existe alguno que quepa, intentar
-      const cabeAlguno = estado.esperando.some(p=> maxHueco >= p.tamaño);
-      if (cabeAlguno) despachar({ tipo: Acciones.INTENTAR_DESDE_ESPERA });
-    }
-  }, [estado.ui.algoritmo, estado.ui.fifoFlexible, estado.segmentos, estado.esperando.length, estado.ui.modo]);
-
-  return (
-    <EstadoContexto.Provider value={{ estado, despachar }}>
-      <div className="min-h-screen bg-slate-100">
-        <Encabezado />
-        <main className="max-w-6xl mx-auto p-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-          {estado.ui.modo==='menu' && <PantallaMenu />}
-          {estado.ui.modo==='dinamicas' && <ModoDinamicas />}
-          {estado.ui.modo==='fijas' && <ModoFijas />}
-        </main>
-        <Snackbar open={!!snack} autoHideDuration={2200} onClose={()=>setSnack(null)}>
-          <Alert severity={snack?.severidad||'info'}>{snack?.mensaje}</Alert>
-        </Snackbar>
-      </div>
-    </EstadoContexto.Provider>
-  );
-}
-
-function Encabezado(){
-  const { estado, despachar } = usarEstado();
-  return (
-    <div className="bg-white border-b">
-      <div className="max-w-6xl mx-auto p-3 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Typography variant="h6"> Sistemas Operativos 2: Gestión de Memoria</Typography>
-          <Divider orientation="vertical" flexItem />
-          <Typography variant="body2" className="text-slate-600">{estado.ui.modo==='menu'? 'Equipo 8' : estado.ui.modo==='dinamicas' ? 'Particiones Dinámicas' : 'Particiones Fijas'}</Typography>
-        </div>
-        <div className="flex items-center gap-2">
-          {estado.ui.modo!=='menu' && (
-            <FormControlLabel control={<Switch checked={!!estado.ui.fifoFlexible} onChange={e=>despachar({tipo:Acciones.TOGGLE_FIFO_FLEX, datos:e.target.checked})} />} label="FIFO flexible" />
-          )}
-          {estado.ui.modo!=='menu' && (
-            <IconButton onClick={()=>despachar({tipo:Acciones.REINICIAR})}><RestartAltIcon/></IconButton>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ------------------------------- Menú --------------------------------------
-function PantallaMenu(){
-  const { estado, despachar } = usarEstado();
-  const [memTexto, setMemTexto] = useState(""); // sin valor por defecto
-  const mem = memTexto===""? NaN : +memTexto; // para validación
-  const soCalculado = Number.isFinite(mem)? Math.floor(mem*0.10) : 0;
-
-  // Configuración manual de fijas
-  const [abrirConfig, setAbrirConfig] = useState(false);
-  const [numPartTexto, setNumPartTexto] = useState("");
-  const numPart = numPartTexto===""? NaN : +numPartTexto;
-  const [tamaños, setTamaños] = useState([]);
-
-  const restante = Number.isFinite(mem)? mem - (tamaños.reduce((a,b)=>a+b,0) || 0) : 0;
-
-  useEffect(()=>{
-    if (Number.isFinite(numPart) && numPart>0){ setTamaños(Array.from({length: numPart}, ()=> 0)); }
-    else setTamaños([]);
-  }, [numPartTexto]);
-
-  return (
-    <div className="md:col-span-3">
-      <Box className="bg-white p-4 rounded-2xl shadow-sm">
-        <Typography variant="h6" className="mb-1">Ingresa tus valores para entrar al simulador </Typography>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <Box className="p-4 border rounded-xl">
-            <Typography variant="subtitle1" className="mb-2">Tamaño de la memoria (KB)</Typography>
-            <div className="grid grid-cols-2 gap-3 items-end">
-              <TextField label="Memoria del usuario (KB)" type="number" value={memTexto} onChange={e=>setMemTexto(e.target.value)} />
-            </div>
-          </Box>
-          <Box className="p-4 border rounded-xl">
-            <Typography variant="subtitle1" className="mb-2">Particiones (Fijas)</Typography>
-            <div className="grid grid-cols-3 gap-3 items-end">
-              <TextField label="# Particiones" type="number" value={numPartTexto} onChange={e=>setNumPartTexto(e.target.value)} />
-              <Button variant="outlined" onClick={()=>{
-                if (!Number.isFinite(mem) || mem<=0) return alert('Ingresa memoria válida primero');
-                if (!Number.isFinite(numPart) || numPart<=0) return alert('Ingresa número de particiones');
-                setAbrirConfig(true);
-              }}>ingresar tamaños</Button>
-              <div className="text-sm text-slate-500">Restante por asignar: {Math.max(0, restante)} KB</div>
-            </div>
-          </Box>
-        </div>
-        <div className="flex gap-3 mt-4">
-          <Button variant="contained" onClick={()=>{
-            if (!Number.isFinite(mem) || mem<=0) return alert('Ingresa memoria válida');
-            despachar({tipo:Acciones.INICIALIZAR_DINAMICAS, datos:{ totalUsuario: mem }});
-          }}>particiones Dinámicas</Button>
-          <Button variant="outlined" onClick={()=>{
-            if (!Number.isFinite(mem) || mem<=0) return alert('Ingresa memoria válida');
-            despachar({tipo:Acciones.ENTRAR_FIJAS, datos:{ totalUsuario: mem }});
-            if (tamaños.length && tamaños.reduce((a,b)=>a+b,0)===mem){
-              despachar({tipo:Acciones.CONFIGURAR_FIJAS_MANUAL, datos:{ tamaños }});
-            }
-          }}>particiones Fijas</Button>
-        </div>
-      </Box>
-
-      <Dialog open={abrirConfig} onClose={()=>setAbrirConfig(false)} fullWidth maxWidth="sm">
-        <DialogTitle>Capturar tamaños (deben sumar {mem||0} KB)</DialogTitle>
-        <DialogContent>
-          <div className="grid grid-cols-2 gap-2 mt-2">
-            {tamaños.map((val,i)=> (
-              <TextField key={i} label={`P${i+1} (KB)`} type="number" value={val} onChange={e=>{
-                const v = Math.max(0, +e.target.value || 0); const arr=[...tamaños]; arr[i]=v; setTamaños(arr);
-              }} />
-            ))}
-          </div>
-          <div className="mt-2 text-sm text-slate-600">Restante por asignar: {Math.max(0, (mem||0) - (tamaños.reduce((a,b)=>a+b,0)||0))} KB</div>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={()=>setAbrirConfig(false)}>Cancelar</Button>
-          <Button variant="contained" onClick={()=>{
-            const suma = tamaños.reduce((a,b)=>a+b,0);
-            if (suma!==mem) return alert(`Faltan ${mem - suma} KB por asignar`);
-            despachar({tipo:Acciones.CONFIGURAR_FIJAS_MANUAL, datos:{ tamaños }});
-            setAbrirConfig(false);
-          }}>Guardar</Button>
-        </DialogActions>
-      </Dialog>
-    </div>
-  );
-}
-
-// ----------------------------- Dinámicas -----------------------------------
-function ModoDinamicas(){
-  const { estado, despachar } = usarEstado();
-  const [nombre, setNombre] = useState("");
-  const [tamañoTexto, setTamañoTexto] = useState("");
-  const tamaño = tamañoTexto===""? NaN : +tamañoTexto;
-
-  const procesosEjecutando = estado.segmentos.filter(s=>s.tipo==='proceso');
-  const huecos = estado.segmentos.filter(s=>s.tipo==='hueco');
-  const libreTotal = huecos.reduce((a,h)=>a+h.tamaño,0);
-  const maxHueco = huecos.length? Math.max(...huecos.map(h=>h.tamaño)) : 0;
-
-  // razones para los de espera
-  const filasEspera = estado.esperando.map(p=>{
-    let nota = '';
-    if (p.tamaño > libreTotal) nota = ' (en espera por falta de memoria)';
-    else if (p.tamaño > maxHueco) nota = ' (en espera por fragmentación externa)';
-    return { ...p, nota };
+function cargarTrabajo(e, nombre, tamKB, granular=false){
+  // (1) Secundario + meta
+  const { paginas, fragInterna } = partirEnPaginas(tamKB);
+  e.secundario[nombre] = paginas; e.tablaMapas[nombre] = {};
+  e.metaTrabajos[nombre] = { tamKB, numPag: paginas.length, fragInterna };
+  if (granular) fotografiar(e, `Secundario listo: ${nombre} (${tamKB}KB) – Pags ${paginas.length} (FI ${fragInterna}KB)`);
+  // (2) Asignación secuencial (un solo paso final por trabajo)
+  paginas.forEach(p=>{
+    const m = marcoLibre(e); if (m===-1) throw new Error('Sin marcos libres (inconsistente)');
+    e.marcos[m] = { marco:m, trabajo:nombre, pagina:p.indice };
+    e.tablaMapas[nombre][p.indice] = m;
+    e.tablaMarcos[m] = { marco:m, estado:'Ocupado', contiene:`${nombre}, P${p.indice}` };
   });
-
-  return (
-    <>
-      <div className="bg-white p-4 rounded-2xl shadow-sm">
-        <Typography variant="subtitle1" className="mb-3">Controles</Typography>
-        <FormControl fullWidth className="mb-3">
-          <InputLabel>Algoritmo</InputLabel>
-          <Select value={estado.ui.algoritmo} label="Algoritmo" onChange={e=>despachar({tipo:Acciones.CAMBIAR_ALGORITMO, datos:e.target.value})}>
-            <MenuItem value="firstFit">First Fit</MenuItem>
-            <MenuItem value="bestFit">Best Fit</MenuItem>
-          </Select>
-        </FormControl>
-        <div className="grid grid-cols-2 gap-2 mb-3">
-          <TextField label="Nombre" value={nombre} onChange={e=>setNombre(e.target.value)} />
-          <TextField label="Tamaño (KB)" type="number" value={tamañoTexto} onChange={e=>setTamañoTexto(e.target.value)} />
-        </div>
-        <div className="flex flex-col gap-3 w-40">
-          <Button fullWidth variant="contained" onClick={()=>{ if(!nombre.trim() || !Number.isFinite(tamaño) || tamaño<=0) return alert('Completa nombre y tamaño (>0)'); despachar({tipo:Acciones.AGREGAR_PROCESO, datos:{ nombre:nombre.trim(), tamaño }}); setNombre(""); setTamañoTexto(""); }}>Agregar</Button>
-          <Button fullWidth color="secondary" variant="outlined" startIcon={<CompressIcon/>} onClick={()=>despachar({tipo:Acciones.COMPACTAR})}>Compactar</Button>
- 
-          <Button fullWidth variant="text" color="inherit" startIcon={<RestartAltIcon/>} onClick={()=>despachar({tipo:Acciones.REINICIAR})}>Reset</Button>
-        </div>
-      </div>
-
-      <div className="md:col-span-2 space-y-4">
-        <Box className="bg-white p-4 rounded-2xl shadow-sm">
-          <div className="flex items-start gap-6">
-            <BarraMemoria totalUsuario={estado.totalUsuario} so={estado.so} segmentos={estado.segmentos} />
-            <PanelEstadisticas e={estado.estadisticas} modo="dinamicas" />
-          </div>
-        </Box>
-        <Box className="bg-white p-4 rounded-2xl shadow-sm">
-          <Typography variant="subtitle1" className="mb-2">Procesos</Typography>
-          <div className="grid grid-cols-2 gap-4">
-            <TablaProcesos titulo="En ejecución" filas={procesosEjecutando} botonAccion={{ etiqueta:'Terminar', color:'error', onClick:(id)=>despachar({tipo:Acciones.TERMINAR, datos:{ idProceso:id }}) }} />
-            <TablaProcesos titulo="En espera" filas={filasEspera} botonAccion={{ etiqueta:'Eliminar', color:'inherit', onClick:(id)=>despachar({tipo:Acciones.ELIMINAR_ESPERA, datos:{ idProceso:id }}) }} mostrarNota />
-          </div>
-        </Box>
-        <PanelCapturas capturas={estado.capturas} />
-      </div>
-    </>
-  );
 }
 
-// ------------------------------- Fijas -------------------------------------
-function ModoFijas(){
-  const { estado, despachar } = usarEstado();
-  const [nombre, setNombre] = useState("");
-  const [tamañoTexto, setTamañoTexto] = useState("");
-  const tamaño = tamañoTexto===""? NaN : +tamañoTexto;
-
-  const ejecutando = estado.fijas.particiones.filter(p=>p.usadoPor).map(p=>p.usadoPor);
-  const maxPart = estado.fijas.particiones.length? Math.max(...estado.fijas.particiones.map(p=>p.tamaño)) : 0;
-  const filasEspera = estado.esperando.map(p=> ({ ...p, nota: (p.tamaño>maxPart? ' (demasiado grande para las particiones)': '') }));
-
-  return (
-    <>
-      <div className="bg-white p-4 rounded-2xl shadow-sm">
-        <Typography variant="subtitle1" className="mb-3">Controles</Typography>
-        <FormControl fullWidth className="mb-3">
-          <InputLabel>Algoritmo</InputLabel>
-          <Select value={estado.ui.algoritmo} label="Algoritmo" onChange={e=>despachar({tipo:Acciones.CAMBIAR_ALGORITMO, datos:e.target.value})}>
-            <MenuItem value="firstFit">First Fit</MenuItem>
-            <MenuItem value="bestFit">Best Fit</MenuItem>
-          </Select>
-        </FormControl>
-        <div className="grid grid-cols-2 gap-2 mb-3">
-          <TextField label="Nombre" value={nombre} onChange={e=>setNombre(e.target.value)} />
-          <TextField label="Tamaño (KB)" type="number" value={tamañoTexto} onChange={e=>setTamañoTexto(e.target.value)} />
-        </div>
-        <div className="flex gap-2">
-          <Button variant="contained" onClick={()=>{ if(!nombre.trim() || !Number.isFinite(tamaño) || tamaño<=0) return alert('Completa nombre y tamaño (>0)'); despachar({tipo:Acciones.AGREGAR_PROCESO_FIJAS, datos:{ nombre:nombre.trim(), tamaño }}); setNombre(""); setTamañoTexto(""); }}>Agregar</Button>
-        </div>
-      </div>
-
-      <div className="md:col-span-2 space-y-4">
-        <Box className="bg-white p-4 rounded-2xl shadow-sm">
-          <div className="flex items-start gap-6">
-            <BarraMemoriaFijas totalUsuario={estado.totalUsuario} so={estado.so} particiones={estado.fijas.particiones} />
-            <PanelEstadisticas e={estado.estadisticas} modo="fijas" />
-          </div>
-        </Box>
-        <Box className="bg-white p-4 rounded-2xl shadow-sm">
-          <Typography variant="subtitle1" className="mb-2">Procesos</Typography>
-          <div className="grid grid-cols-2 gap-4">
-            <TablaProcesos titulo="En ejecución" filas={ejecutando} botonAccion={{ etiqueta:'Terminar', color:'error', onClick:(id)=>despachar({tipo:Acciones.TERMINAR_FIJAS, datos:{ idProceso:id }}) }} />
-            <TablaProcesos titulo="En espera" filas={filasEspera} botonAccion={{ etiqueta:'Eliminar', color:'inherit', onClick:(id)=>despachar({tipo:Acciones.ELIMINAR_ESPERA, datos:{ idProceso:id }}) }} mostrarNota />
-          </div>
-        </Box>
-        <PanelCapturas capturas={estado.capturas} />
-      </div>
-    </>
-  );
+function descargarTrabajo(e, nombre){
+  let liberados = [];
+  e.marcos.forEach((m,i)=>{
+    if(m.trabajo===nombre){
+      e.marcos[i] = { marco:i, trabajo:null, pagina:null };
+      e.tablaMarcos[i] = { marco:i, estado:'Libre', contiene:null };
+      liberados.push(i);
+    }
+  });
+  fotografiar(e, `Salida de ${nombre}: liberados ${liberados.map(x=>'M'+x).join(', ')}`);
 }
 
-// ================================ Widgets ==================================
-function BarraMemoria({ totalUsuario, so, segmentos }){
-  const ocultarEtiquetaPct = 1; // <1% se oculta
-  const totalVisual = so + totalUsuario;
-  return (
-    <div className="w-32 h-96 border rounded-xl overflow-hidden relative">
-      {/* SO arriba, no participa en métricas */}
-      <div style={{ height: `${(so/totalVisual)*100}%`, background:'#1f2937' }} className="w-full border-b-2 border-black flex items-center justify-center text-[10px] text-white/90">SO</div>
-      {segmentos.filter(s=>s.tipo!=='os').map((s)=>{
-        const pct = (s.tamaño/totalVisual)*100;
-        const alto = `${pct}%`;
-        const esHueco = s.tipo==='hueco';
-        const fondo = esHueco? 'repeating-linear-gradient(45deg,#e5e7eb, #e5e7eb 6px, #f3f4f6 6px, #f3f4f6 12px)' : (s.color||'#93c5fd');
-        const etiqueta = esHueco? `${s.tamaño}KB libre` : `${s.nombre} (${s.tamaño}KB)`;
-        return (
-          <Tooltip key={s.id} title={etiqueta} placement="right">
-            <div style={{ height: alto, background: fondo }} className="w-full border-b last:border-b-0 flex items-center justify-center text-[10px] text-slate-800">
-              {pct>=ocultarEtiquetaPct && !esHueco && <span className="text-white/90">{s.nombre} ({s.tamaño}KB)</span>}
-            </div>
-          </Tooltip>
-        );
-      })}
-    </div>
-  );
+function traducir(e, nombre, dvKB){
+  const pagina = Math.floor(dvKB / TAM_PAGINA_KB);
+  const desp   = dvKB % TAM_PAGINA_KB;
+  const marco  = e.tablaMapas[nombre][pagina];
+  const df     = marco * TAM_PAGINA_KB + desp;
+  return { pagina, desp, marco, df };
 }
 
-function BarraMemoriaFijas({ totalUsuario, so, particiones }){
-  const totalVisual = so + totalUsuario;
+function ejecutarEjercicio1(){
+  const e = crearEstadoInicial();
+  // ---- PASO 1: T1 llega y se traduce ----
+  cargarTrabajo(e,'T1',225,false);
+  const r1 = traducir(e,'T1',125);
+  fotografiar(e, `T1 listo (225KB). Traducción 125KB → pág ${r1.pagina}, desp ${r1.desp} → M${r1.marco} → DF ${r1.df}KB`, { trabajo:'T1', dv:125, pagina:r1.pagina, marco:r1.marco, df:r1.df });
+  e.marcadores.tradT1 = e.historial.length-1;
+
+  // ---- PASO 2: T2 llega y se traduce ----
+  cargarTrabajo(e,'T2',100,false);
+  const r2 = traducir(e,'T2',55);
+  fotografiar(e, `T2 listo (100KB). Traducción 55KB → pág ${r2.pagina}, desp ${r2.desp} → M${r2.marco} → DF ${r2.df}KB`, { trabajo:'T2', dv:55, pagina:r2.pagina, marco:r2.marco, df:r2.df });
+  e.marcadores.tradT2 = e.historial.length-1;
+
+  // ---- PASO 3: Sale T1 ----
+  descargarTrabajo(e,'T1');
+  e.marcadores.salioT1 = e.historial.length-1;
+
+  // ---- PASO 4: T3 llega y se traduce ----
+  cargarTrabajo(e,'T3',500,false);
+  const r3 = traducir(e,'T3',425);
+  fotografiar(e, `T3 listo (500KB). Traducción 425KB → pág ${r3.pagina}, desp ${r3.desp} → M${r3.marco} → DF ${r3.df}KB`, { trabajo:'T3', dv:425, pagina:r3.pagina, marco:r3.marco, df:r3.df });
+  e.marcadores.tradT3 = e.historial.length-1;
+
+  // ---- PASO 5: T4 llega y se traduce ----
+  cargarTrabajo(e,'T4',50,false);
+  const r4 = traducir(e,'T4',25);
+  fotografiar(e, `T4 listo (50KB). Traducción 25KB → pág ${r4.pagina}, desp ${r4.desp} → M${r4.marco} → DF ${r4.df}KB`, { trabajo:'T4', dv:25, pagina:r4.pagina, marco:r4.marco, df:r4.df });
+  e.marcadores.tradT4 = e.historial.length-1;
+
+  return e;
+}
+
+// ------------------- UI (todo en un componente) -------------------
+export default function App(){
+  const sim = useMemo(()=> ejecutarEjercicio1(), []);
+  const [i, setI] = useState(sim.historial.length-1); // final por defecto
+  const paso = sim.historial[i];
+
+  // --- Estado y derivadas para DV interactiva del trabajo actual ---
+  const [dvOverride, setDvOverride] = useState(null);
+  const ligBase = paso.ligadura || null;
+  let ligUI = ligBase;
+  if (ligBase && dvOverride !== null) {
+    const t = traducirSnapshot(paso, ligBase.trabajo, Number(dvOverride));
+    if (t) ligUI = t;
+  }
+  const trabajoActual = ligUI?.trabajo || ligBase?.trabajo || null;
+  const metaActual = trabajoActual ? paso.metaTrabajos?.[trabajoActual] : null;
+  const maxDV = metaActual ? Math.max(0, metaActual.tamKB - 1) : 0;
+
+  // Tests rápidos (consola) para asegurar core estable
+  useMemo(()=>{ runSmokeTests(); },[]);
+
   return (
-    <div className="w-40 h-96 border rounded-xl overflow-hidden relative">
-      <div style={{ height: `${(so/totalVisual)*100}%`, background:'#1f2937' }} className="w-full border-b-2 border-black flex items-center justify-center text-[10px] text-white/90">SO</div>
-      {particiones.map(p=>{
-        const pctContenedor = (p.tamaño/totalVisual)*100;
-        const usado = p.usadoPor?.tamaño || 0;
-        const pctUsado = p.tamaño>0 ? (usado/p.tamaño)*100 : 0;
-        const hayProceso = !!p.usadoPor;
-        const tooltip = (
+    <div style={{minHeight:'100vh',background:'#f1f5f9',padding:24,fontFamily:'Inter,system-ui,Arial'}}>
+      <nav style={{background:'#1d4ed8',color:'#fff',borderRadius:12,padding:16,marginBottom:16}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap'}}>
           <div>
-            <div><b>Partición {p.índice}:</b> {p.tamaño}KB</div>
-            {hayProceso ? <div><b>{p.usadoPor.nombre}:</b> {p.usadoPor.tamaño}KB</div> : <div>Vacía</div>}
+            <div style={{fontSize:22,fontWeight:600}}>Ejercicio 1 de Memoria Paginada — Equipo 8</div>
+            <div style={{opacity:0.9,fontSize:13,marginTop:2}}> Total de Memoria {TAM_MEMORIA_KB} KB · Número de Páginas {TAM_PAGINA_KB} KB</div>
           </div>
-        );
-        return (
-          <Tooltip key={p.id} title={tooltip} placement="right">
-            <div style={{ height: `${pctContenedor}%` }} className="w-full border-b-2 border-slate-400 relative">
-              {/* Relleno del proceso (proporcional dentro de la partición) */}
-              {hayProceso ? (
-                <div className="absolute left-0 top-0 w-full" style={{ height: `${pctUsado}%`, background: p.usadoPor.color }}>
-                  <div className="h-full w-full flex items-center justify-center text-[10px] text-white/90">{p.usadoPor.nombre} ({p.usadoPor.tamaño}KB)</div>
-                </div>
-              ) : null}
-              {/* Fragmentación interna */}
-              <div className="absolute left-0 bottom-0 w-full" style={{ height: `${100 - pctUsado}%`, background: hayProceso? 'repeating-linear-gradient(45deg,#ffffff,#ffffff 6px,#ef4444 6px,#ef4444 12px)' : 'repeating-linear-gradient(45deg,#e5e7eb,#e5e7eb 6px,#f3f4f6 6px,#f3f4f6 12px)' }} />
-              {/* Etiqueta de la partición (borde superior visible) */}
-              <div className="absolute inset-0 pointer-events-none flex items-start justify-center pt-1">
-                <span className="text-[10px] bg-white/70 px-1 rounded">P{p.índice} ({p.tamaño}KB)</span>
+          <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+            <button onClick={()=>setI(sim.marcadores.tradT1)} style={btnNav()}>LLega T1</button>
+            <button onClick={()=>setI(sim.marcadores.tradT2)} style={btnNav()}>LLega T2</button>
+            <button onClick={()=>setI(sim.marcadores.salioT1)} style={btnNav()}>Salida T1</button>
+            <button onClick={()=>setI(sim.marcadores.tradT3)} style={btnNav()}>LLega T3</button>
+            <button onClick={()=>setI(sim.marcadores.tradT4)} style={btnNav()}>LLega T4</button>
+          </div>
+        </div>
+      </nav>
+      {/* Forzamos grid responsivo: 1 col en móvil, 2 cols en desktop; y full-row abarca ambas */}
+      <style>{`
+        .grid-panels { display:grid; gap:16px; grid-template-columns: 1fr; }
+        @media (min-width: 1024px) { .grid-panels { grid-template-columns: 1fr 1fr; } }
+        @media (min-width: 1024px) { .full-row { grid-column: 1 / -1; } }
+      `}</style>
+      <div className="grid-panels">
+        {/* (1) Secundario en tabla */}
+        <Panel titulo="1. Arreglo de almacenamiento secundario">
+          {trabajoActual ? (
+            <table style={{width:'100%',fontSize:14,border:'1px solid #e5e7eb'}}>
+              <thead style={{background:'#f8fafc'}}>
+                <tr>
+                  <th style={th()}>Trabajo</th>
+                  <th style={th()}>Página</th>
+                  <th style={th()}>Rango (KB)</th>
+                  <th style={th()}>T. Página</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(paso.secundario?.[trabajoActual]||[]).map(p=> (
+                  <tr key={`${trabajoActual}-${p.indice}`}>
+                    <td style={td()}>{trabajoActual}</td>
+                    <td style={td()}>P{p.indice}</td>
+                    <td style={td()}>{p.inicio} – {p.fin}</td>
+                    <td style={td()}>{TAM_PAGINA_KB} KB</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p style={{fontSize:14,margin:0,color:'#64748b'}}>NO EXISTE EN ESTE PASO</p>
+          )}
+        </Panel>
+
+        {/* (2) Memoria principal */}
+        <Panel titulo="2. Arreglo de Memoria principal (marcos 0..6)">
+          <div style={{display:'grid'}}>
+            {paso.marcos.map((m,idx)=> (
+              <div key={idx} style={{display:'flex',justifyContent:'space-between',padding:'6px 8px',borderBottom:'1px solid #e5e7eb'}}>
+                <span style={{fontSize:14}}>Marco {idx}</span>
+                <span style={{fontFamily:'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace'}}>{m.trabajo? `${m.trabajo}, P${m.pagina}` : 'Libre'}</span>
               </div>
-            </div>
-          </Tooltip>
-        );
-      })}
-    </div>
-  );
-}
-
-function PanelEstadisticas({ e, modo }){
-  return (
-    <div className="flex-1 grid grid-cols-2 gap-3">
-      <TarjetaEstadística etiqueta="Usada" valor={`${e.usada} KB`} />
-      <TarjetaEstadística etiqueta="Libre" valor={`${e.libre} KB`} />
-      {modo==='dinamicas' && <TarjetaEstadística etiqueta="Frag. Externa" valor={`${e.fragExterna} KB`} />}
-      {modo==='fijas' && <TarjetaEstadística etiqueta="Frag. Interna" valor={`${e.fragInterna} KB`} />}
-      {modo==='fijas' && <TarjetaEstadística etiqueta="Desperdicio particiones vacías" valor={`${e.desperdicioVacias} KB`} />}
-      <TarjetaEstadística etiqueta="Desperdicio Total" valor={`${e.desperdicio} KB`} />
-    </div>
-  );
-}
-function TarjetaEstadística({ etiqueta, valor }){
-  return (
-    <div className="p-3 rounded-xl border">
-      <div className="text-xs text-slate-500">{etiqueta}</div>
-      <div className="text-lg font-medium">{valor}</div>
-    </div>
-  );
-}
-
-function TablaProcesos({ titulo, filas, botonAccion, mostrarNota=false }){
-  return (
-    <div className="border rounded-xl overflow-hidden">
-      <div className="px-3 py-2 bg-slate-50 border-b text-sm font-medium">{titulo}</div>
-      <div className="max-h-56 overflow-auto">
-        <table className="w-full text-sm">
-          <thead className="sticky top-0 bg-slate-50">
-            <tr className="text-left"><th className="px-2 py-1">Nombre</th><th className="px-2 py-1">Tamaño</th><th className="px-2 py-1">Acción</th></tr>
-          </thead>
-          <tbody>
-            {filas.length===0 && <tr><td colSpan={3} className="px-2 py-2 text-slate-400">Vacío</td></tr>}
-            {filas.map(p=> (
-              <tr key={p.id} className={`hover:bg-slate-50`}>
-                <td className="px-2 py-1">
-                  {p.nombre}
-                  {mostrarNota && p.nota && <span className="ml-1 text-[10px] text-slate-500">{p.nota}</span>}
-                </td>
-                <td className="px-2 py-1">{p.tamaño} KB</td>
-                <td className="px-2 py-1">
-                  {botonAccion && <Button size="small" color={botonAccion.color||'primary'} onClick={()=>botonAccion.onClick?.(p.id)}>{botonAccion.etiqueta||'Acción'}</Button>}
-                </td>
-              </tr>
             ))}
-          </tbody>
-        </table>
+          </div>
+        </Panel>
+
+        {/* (3) TMP por trabajo */}
+        <Panel titulo="3. Tabla de mapa de páginas (TMP)">
+          {trabajoActual ? (
+            <table style={{width:'100%',fontSize:14,marginBottom:12,border:'1px solid #e5e7eb'}}>
+              <thead style={{background:'#f8fafc'}}>
+                <tr><th style={th()}>Trabajo {trabajoActual}</th><th style={th()}>Marco</th></tr>
+              </thead>
+              <tbody>
+                {Object.entries(paso.tablaMapas?.[trabajoActual]||{}).map(([pag,marco])=> (
+                  <tr key={pag}><td style={td()}>Pág. {pag}</td><td style={td()}>M{marco}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+          <p style={{fontSize:14,margin:0,color:'#64748b'}}>NO EXISTE EN ESTE PASO</p>
+          )}
+        </Panel>
+
+        {/* (4) Tabla de marcos */}
+        <Panel titulo="4.Tabla de marcos de pagina">
+          <table style={{width:'100%',fontSize:14,border:'1px solid #e5e7eb'}}>
+            <thead style={{background:'#f8fafc'}}>
+              <tr><th style={th()}># Marco</th><th style={th()}>Estado</th></tr>
+            </thead>
+            <tbody>
+              {paso.tablaMarcos.map(r=> {
+                const esObjetivo = ligUI && ligUI.marco===r.marco;
+                return (
+                  <tr key={r.marco} style={esObjetivo? {background:'#fff7ed'}:undefined}>
+                    <td style={td()}>M{r.marco}</td>
+                    <td style={td()}>{r.estado}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Panel>
+
+        {/* (5) Traducción (del paso) */}
+        <Panel titulo="5. Cálculo de traducción DV → DF">
+          {ligUI ? (
+            <PasoAPasoCalculo datos={ligUI} />
+          ) : (
+            <p style={{fontSize:14,margin:0}}>No hay traducción en este paso.</p>
+          )}
+        </Panel>
+
+        {/* (6) Línea roja Secundario ↔ Memoria principal */}
+        <Panel titulo="6. Relación de la dirección virtual con la física">
+          {ligUI ? (
+            <LigaduraRelacion paso={paso} datos={ligUI} />
+          ) : (
+            <p style={{fontSize:14,margin:0}}>No hay traducción en este paso.</p>
+          )}
+        </Panel>
+
+        {/* (7) Ficha del trabajo (vista completa) */}
+        <div className="full-row">
+          <Panel titulo="7. Datos del trabajo actual">
+            {ligUI ? (
+              <>
+                {/* Selector de DV para el trabajo activo */}
+
+                <DetalleTrabajo paso={paso} datos={ligUI} />
+              </>
+            ) : (
+              <p style={{fontSize:14,margin:0}}> NO HAY TRADUCCIÓN EN ESTE PASO</p>
+            )}
+          </Panel>
+        </div>
       </div>
     </div>
   );
 }
 
-function PanelCapturas({ capturas }){
+// ------------------- Componentes auxiliares -------------------
+function PasoAPasoCalculo({ datos }){
+  const TP = 100; // tamaño de página fijo del ejercicio
+  const pasos = [
+    { k:'Dirección virtual', v:`${datos.dv} KB` },
+    { k:'Tamaño de página', v:`${TP} KB` },
+    { k:'Página', v:`⌊${datos.dv}/${TP}⌋ = ${Math.floor(datos.dv/TP)}` },
+    { k:'Desplazamiento', v:`${datos.dv} % ${TP} = ${datos.dv % TP}` },
+    { k:'Marco', v:`TMP[${datos.trabajo}][${Math.floor(datos.dv/TP)}] = M${datos.marco}` },
+    { k:'Dirección física', v:`M${datos.marco} * ${TP} + ${datos.dv % TP} = ${datos.df} KB` },
+  ];
   return (
-   console.log(capturas)
+    <div style={{border:'1px solid #e5e7eb',borderRadius:12,padding:12,background:'#fff'}}>
+      <div style={{fontWeight:600,marginBottom:8}}>Trabajo {datos.trabajo}</div>
+      <ol style={{margin:0,paddingLeft:18}}>
+        {pasos.map((p,i)=> (
+          <li key={i} style={{margin:'4px 0'}}>
+            <span style={{fontWeight:600}}>{p.k}:</span> <span style={{fontFamily:'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\"'}}>{p.v}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
+}
+
+function traducirSnapshot(paso, trabajo, dv){
+  const TP = 100;
+  const pagina = Math.floor(dv / TP);
+  const desp   = dv % TP;
+  const marco  = (paso.tablaMapas?.[trabajo]?.[pagina]);
+  if (marco === undefined) return null;
+  const df     = marco * TP + desp;
+  return { trabajo, dv, pagina, desp, marco, df };
+}
+
+function getDVejemplos(meta){
+  if (!meta) return [];
+  const dv1 = 0;                 // inicio
+  const dv2 = Math.max(0, meta.tamKB - 1); // último byte
+  const dv3 = meta.tamKB >= 125 ? 125 : Math.floor(meta.tamKB/2); // una DV didáctica
+  const set = Array.from(new Set([dv1, dv2, dv3]));
+  return set;
+}
+
+function Campo({ klabel, valor, mono }){
+  return (
+    <div style={{display:'flex',justifyContent:'space-between',gap:12,alignItems:'center'}}>
+      <div style={{color:'#64748b'}}>{klabel}</div>
+      <div style={mono? {fontFamily:'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\"'} : undefined}>{valor}</div>
+    </div>
+  );
+}
+
+function DetalleTrabajo({ paso, datos }){
+  const meta = paso.metaTrabajos?.[datos.trabajo];
+  const mapa = paso.tablaMapas?.[datos.trabajo] || {};
+  const marcosOcupados = Object.values(mapa).sort((a,b)=>a-b);
+  const ocupacionKB = marcosOcupados.length * TAM_PAGINA_KB;
+  return (
+    <div style={{border:'1px solid #e5e7eb',borderRadius:12,overflow:'hidden'}}>
+      <div style={{padding:12,background:'#111827',color:'#f9fafb',display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}}>
+        <div style={{fontWeight:700,letterSpacing:0.2}}>Ficha del Trabajo {datos.trabajo}</div>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+          <span style={statPill('#e0e7ff','#3730a3')}>Tamaño: {meta?.tamKB} KB</span>
+          <span style={statPill('#dcfce7','#065f46')}>Páginas: {meta?.numPag}</span>
+          <span style={statPill('#fee2e2','#991b1b')}>Frag Interna: {meta?.fragInterna} KB</span>
+          <span></span>
+        </div>
+      </div>
+
+      <div style={{padding:12,display:'grid',gap:16,gridTemplateColumns:'1fr 1fr'}}>
+        <div>
+          <div style={{fontWeight:600,marginBottom:6}}>Direcciones</div>
+          <div style={{display:'grid',rowGap:8}}>
+            <Campo klabel="Dirección Virtual" valor={`${datos.dv} KB`} mono/>
+            <Campo klabel="Página" valor={`P${datos.pagina}`} />
+            <Campo klabel="Marco" valor={`M${datos.marco}`} />
+            <Campo klabel="Dirección Física" valor={`${datos.df} KB`} mono/>
+          </div>
+        </div>
+        <div> 
+          <div style={{fontWeight:600,marginBottom:6}}>Marcos que ocupa</div>
+          <div style={{display:'flex',gap:12,flexWrap:'wrap'}}>
+            {marcosOcupados.length? marcosOcupados.map(m=> <span key={m} style={pill()}>M{m}</span>) : <span style={{color:'#64748b'}}>—</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Panel({ titulo, children }){
+  return (
+    <div style={{background:'#fff',padding:12,border:'1px solid #e5e7eb',borderRadius:12}}>
+      <div style={{fontWeight:600,marginBottom:8}}>{titulo}</div>
+      {children}
+    </div>
+  );
+}
+
+function LigaduraRelacion({ paso, datos }){
+  const contRef = useRef(null);
+  const izqRef = useRef(null);   // fila Secundario (página)
+  const derRef = useRef(null);   // fila Memoria principal (marco)
+  const [coords, setCoords] = useState(null);
+
+  useLayoutEffect(() => {
+    if (!contRef.current || !izqRef.current || !derRef.current) return;
+    const c = contRef.current.getBoundingClientRect();
+    const a = izqRef.current.getBoundingClientRect();
+    const b = derRef.current.getBoundingClientRect();
+    setCoords({
+      x1: a.left - c.left + a.width,
+      y1: a.top  - c.top  + a.height/2,
+      x2: b.left - c.left,
+      y2: b.top  - c.top  + b.height/2,
+      w: c.width,
+      h: c.height,
+    });
+  }, [paso, datos]);
+
+  const pags = paso.secundario?.[datos.trabajo] || [];
+  const marcoObjetivo = datos.marco;
+
+  return (
+    <div ref={contRef} style={{position:'relative'}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+        {/* Secundario izquierda */}
+        <div>
+          <div style={{fontWeight:600,marginBottom:6}}>Almacenamiento Secundario – {datos.trabajo}</div>
+          <table style={{width:'100%',fontSize:14,border:'1px solid #e5e7eb'}}>
+            <thead style={{background:'#f8fafc'}}>
+              <tr><th style={th()}>Página</th><th style={th()}>Rango (KB)</th></tr>
+            </thead>
+            <tbody>
+              {pags.map(p=>{
+                const esRow = (p.indice===datos.pagina);
+                return (
+                  <tr key={p.indice} ref={esRow? izqRef:null} style={esRow? {background:'#fee2e2'}:undefined}>
+                    <td style={td()}>Pág. {p.indice}</td>
+                    <td style={td()}>{p.inicio}-{p.fin}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {/* Memoria principal derecha */}
+        <div>
+          <div style={{fontWeight:600,marginBottom:6}}>Memoria Principal</div>
+          <table style={{width:'100%',fontSize:14,border:'1px solid #e5e7eb'}}>
+            <thead style={{background:'#f8fafc'}}>
+              <tr><th style={th()}># Marco</th><th style={th()}>Contiene</th></tr>
+            </thead>
+            <tbody>
+              {paso.marcos.map((m)=>{
+                const esRow = (m.marco===marcoObjetivo);
+                return (
+                  <tr key={m.marco} ref={esRow? derRef:null} style={esRow? {background:'#fee2e2'}:undefined}>
+                    <td style={td()}>M{m.marco}</td>
+                    <td style={td()}>{m.trabajo? `${m.trabajo}, P${m.pagina}` : 'Libre'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {coords && (
+        <svg width={coords.w} height={coords.h} style={{position:'absolute',left:0,top:0,pointerEvents:'none'}}>
+          <defs>
+            <marker id="flechaRel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626" />
+            </marker>
+          </defs>
+          <path d={`M ${coords.x1} ${coords.y1} C ${(coords.x1+coords.x2)/2} ${coords.y1}, ${(coords.x1+coords.x2)/2} ${coords.y2}, ${coords.x2} ${coords.y2}`} fill="none" stroke="#dc2626" strokeWidth="2.5" markerEnd="url(#flechaRel)"/>
+        </svg>
+      )}
+    </div>
+  );
+}
+
+// ------------------- UI helpers -------------------
+function btn(){ return { padding:'4px 12px', border:'1px solid #e5e7eb', background:'#e2e8f0', borderRadius:8, cursor:'pointer' }; }
+function btnSmall(){ return { padding:'2px 8px', border:'1px solid #e5e7eb', background:'#e2e8f0', borderRadius:8, cursor:'pointer', fontSize:12 }; }
+function pill(){ return { fontSize:12, padding:'2px 8px', border:'1px solid #e5e7eb', background:'#f8fafc', borderRadius:16 }; }
+function pillInfo(){ return { fontSize:12, padding:'2px 8px', border:'1px solid #e5e7eb', background:'#eef2ff', color:'#3730a3', borderRadius:16 }; }
+function statPill(bg, fg){ return { fontSize:12, padding:'2px 8px', border:`1px solid ${fg}`, background:bg, color:fg, borderRadius:16 }; }
+function th(){ return { textAlign:'left', padding:'6px 8px', borderBottom:'1px solid #e5e7eb' }; }
+function td(){ return { padding:'6px 8px', borderBottom:'1px solid #e5e7eb' }; }
+function btnNav(){ return { padding:'6px 10px', border:'1px solid rgba(255,255,255,0.35)', background:'rgba(255,255,255,0.12)', color:'#fff', borderRadius:8, cursor:'pointer' }; }
+function btnSmallNav(){ return { padding:'4px 8px', border:'1px solid rgba(255,255,255,0.35)', background:'rgba(255,255,255,0.12)', color:'#fff', borderRadius:8, cursor:'pointer', fontSize:12 }; }
+
+// ------------------- Tests rápidos (no interactúan con UI) -------------------
+function runSmokeTests(){
+  try {
+    console.group('%cSMOKE TESTS','color:#2563eb');
+    // 1) Helpers existen
+    console.assert(typeof statPill === 'function', 'statPill debe existir');
+    console.assert(typeof Campo === 'function', 'Campo debe existir');
+
+    // 2) Ejecución del ejercicio
+    const s = ejecutarEjercicio1();
+    console.assert(Array.isArray(s.historial) && s.historial.length === 5, 'Historial debe tener 5 pasos');
+    console.assert(Array.isArray(s.marcos) && s.marcos.length === 7, 'Debe haber 7 marcos');
+
+    // 3) Traducción conocida (fórmula)
+    const t1 = traducir(s, 'T1', 125);
+    console.assert(t1 && t1.pagina === 1 && typeof t1.marco === 'number' && typeof t1.df === 'number', 'Traducción T1 válida');
+
+    // 4) Snapshot de "Salió T1" debe tener marcos de T1 liberados
+    const snapSalioT1 = s.historial[s.marcadores.salioT1];
+    const tieneT1 = snapSalioT1.marcos.some(m=> m.trabajo === 'T1');
+    console.assert(!tieneT1, 'Tras salir T1, no debe quedar T1 en marcos');
+
+    // 5) Consistencia TMP↔Tabla de marcos para T2 P0
+    const marcoT2P0 = s.historial[s.marcadores.tradT2].tablaMapas['T2'][0];
+    const contiene = s.historial[s.marcadores.tradT2].tablaMarcos[marcoT2P0].contiene;
+    console.assert(contiene && contiene.startsWith('T2'), 'Marco de T2 P0 debe contener T2');
+
+    // 6) traducirSnapshot límite: DV fuera de rango debe dar null
+    const snapT4 = s.historial[s.marcadores.tradT4];
+    const metaT4 = snapT4.metaTrabajos['T4'];
+    const fuera = traducirSnapshot(snapT4,'T4', metaT4.tamKB + 5);
+    console.assert(fuera === null, 'DV > tamaño trabajo debe ser null en traducirSnapshot');
+
+    console.log('OK');
+    console.groupEnd();
+  } catch (err) {
+    console.error('Smoke tests fallaron:', err);
+  }
 }
