@@ -136,7 +136,7 @@ function ejecutarEjercicio1(){
 // ------------------- UI (todo en un componente) -------------------
 export default function App(){
   const sim = useMemo(()=> ejecutarEjercicio1(), []);
-  const [i, setI] = useState(sim.historial.length-1); // final por defecto
+  const [i, setI] = useState(0); // iniciar en Paso 1
   const paso = sim.historial[i];
 
   // --- Estado y derivadas para DV interactiva del trabajo actual ---
@@ -171,6 +171,19 @@ export default function App(){
           </div>
         </div>
       </nav>
+      {/* Banner de estado del paso actual */}
+<div style={{background:'#fff',border:'1px solid #e5e7eb',borderRadius:12,padding:12,marginBottom:12,display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+  <span style={{fontSize:12,letterSpacing:0.4,color:'#1d4ed8',fontWeight:700,textTransform:'uppercase'}}>Estado</span>
+  <span style={{fontWeight:600}}>
+    {i === sim.marcadores.tradT1 && "Llega T1 (225KB)"}
+    {i === sim.marcadores.tradT2 && "Llega T2 (100KB)"}
+    {i === sim.marcadores.salioT1 && "Sale T1"}
+    {i === sim.marcadores.tradT3 && "Llega T3 (500KB)"}
+    {i === sim.marcadores.tradT4 && "Llega T4 (50KB)"}
+  </span>
+  <span style={{marginLeft:'auto',fontSize:12,color:'#64748b'}}>Paso {i+1} de {sim.historial.length}</span>
+</div>
+
       {/* Forzamos grid responsivo: 1 col en móvil, 2 cols en desktop; y full-row abarca ambas */}
       <style>{`
         .grid-panels { display:grid; gap:16px; grid-template-columns: 1fr; }
