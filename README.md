@@ -2,6 +2,12 @@
 
 Simulador visual para la materia **Sistemas Operativos** que muestra, paso a paso, cómo funciona la **paginación**: cómo se dividen los trabajos en páginas, cómo se cargan en los marcos de la memoria principal y cómo se traduce una **dirección virtual (DV) a dirección física (DF)**.
 
+<p align="center">
+  <a href="https://departamental-eq8.netlify.app" target="_blank" rel="noopener">
+    <img src="https://img.shields.io/badge/%F0%9F%9A%80%20Abrir%20simulador-00C7B7?style=for-the-badge&logo=netlify&logoColor=white" alt="Abrir en Netlify" />
+  </a>
+</p>
+
 ![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black)
 ![Tailwind](https://img.shields.io/badge/Tailwind_CSS-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)
 ![Vite](https://img.shields.io/badge/Vite-646CFF?style=flat-square&logo=vite&logoColor=white)
